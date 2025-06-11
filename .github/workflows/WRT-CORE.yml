@@ -1,4 +1,4 @@
-#云编译公用核心
+#云编译公用核心 - 优化缓存版本
 name: WRT-CORE
 
 on:
@@ -74,7 +74,7 @@ jobs:
           sudo -E apt -yqq autoremove --purge
           sudo -E apt -yqq autoclean
           sudo -E apt -yqq clean
-          sudo -E apt -yqq install dos2unix python3-netifaces libfuse-dev
+          sudo -E apt -yqq install dos2unix libfuse-dev
           sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
           sudo -E systemctl daemon-reload
           sudo -E timedatectl set-timezone "Asia/Shanghai"
@@ -108,48 +108,97 @@ jobs:
         run: |
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
 
-      - name: Check Caches
-        id: check-cache
+      # 优化1: 拆分缓存，提高命中率
+      - name: Cache Toolchain
+        id: cache-toolchain
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@main
+        uses: actions/cache@v4
         with:
-          key: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
-          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}
+          key: toolchain-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
+          restore-keys: |
+            toolchain-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
+            toolchain-${{env.WRT_CONFIG}}-
           path: |
-            ./wrt/.ccache
             ./wrt/staging_dir/host*
             ./wrt/staging_dir/tool*
+
+      - name: Cache CCCache
+        id: cache-ccache
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache@v4
+        with:
+          key: ccache-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{github.run_number}}
+          restore-keys: |
+            ccache-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
+            ccache-${{env.WRT_CONFIG}}-
+          path: ./wrt/.ccache
+
+      # 优化2: 新增下载包缓存
+      - name: Cache Downloads
+        id: cache-downloads
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache@v4
+        with:
+          key: downloads-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{hashFiles('./wrt/feeds.conf.default')}}
+          restore-keys: |
+            downloads-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
+            downloads-${{env.WRT_CONFIG}}-
+          path: ./wrt/dl
+
+      # 优化3: 新增feeds缓存
+      - name: Cache Feeds
+        id: cache-feeds
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache@v4
+        with:
+          key: feeds-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{hashFiles('./wrt/feeds.conf.default')}}
+          restore-keys: |
+            feeds-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
+            feeds-${{env.WRT_CONFIG}}-
+          path: |
+            ./wrt/feeds
+            ./wrt/package/feeds
 
       - name: Update Caches
         if: env.WRT_TEST != 'true'
         run: |
+          # 配置CCCache
+          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
+          export USE_CCACHE=1
+          ccache -M 2G
+          ccache -s
+
           if [ -d "./wrt/staging_dir" ]; then
             find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
               find "$DIR" -type f -exec touch {} +
             done
 
             mkdir -p ./wrt/tmp && echo "1" > ./wrt/tmp/.build
-
-            echo "toolchain skiped done!"
+            echo "toolchain cache restored!"
           else
-            echo "caches missed!"
+            echo "toolchain cache missed!"
           fi
 
-          if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
-            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
+          # 清理旧缓存的逻辑保持不变，但只针对旧的组合缓存
+          if ${{steps.cache-toolchain.outputs.cache-hit != 'true'}}; then
+            CACHE_LIST=$(gh cache list --key "toolchain-$WRT_CONFIG-$WRT_INFO" | cut -f 1 | head -5)
             for CACHE_KEY in $CACHE_LIST; do
-              gh cache delete $CACHE_KEY
+              gh cache delete $CACHE_KEY || true
             done
-
-            echo "caches cleanup done!"
+            echo "old toolchain caches cleaned!"
           fi
 
       - name: Update Feeds
         run: |
           cd ./wrt/
 
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          # 如果feeds缓存命中，跳过更新
+          if [ "${{steps.cache-feeds.outputs.cache-hit}}" = "true" ]; then
+            echo "feeds cache hit, skipping update"
+          else
+            ./scripts/feeds update -a
+            ./scripts/feeds install -a
+          fi
 
       - name: Custom Packages
         run: |
@@ -161,6 +210,10 @@ jobs:
       - name: Custom Settings
         run: |
           cd ./wrt/
+
+          # 启用CCCache
+          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
+          export USE_CCACHE=1
 
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
@@ -184,7 +237,14 @@ jobs:
         run: |
           cd ./wrt/
 
+          # 启用CCCache
+          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
+          export USE_CCACHE=1
+
           make -j$(nproc) || make -j$(nproc) V=s
+
+          # 显示CCCache统计
+          ccache -s
 
       - name: Machine Information
         run: |
@@ -197,12 +257,20 @@ jobs:
           echo "======================="
           du -h --max-depth=1
           echo "======================="
+          
+          # 显示缓存使用情况
+          if [ -d ".ccache" ]; then
+            echo "CCCache Statistics:"
+            export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
+            ccache -s
+            echo "======================="
+          fi
 
       - name: Package Firmware
         run: |
           cd ./wrt/ && mkdir ./upload/
 
-          cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
+          cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_INFO"-"$WRT_DATE".txt
 
           if [[ $WRT_TEST != 'true' ]]; then
             echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
@@ -213,7 +281,7 @@ jobs:
             for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
               EXT=$(basename $FILE | cut -d '.' -f 2-)
               NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
-              NEW_FILE="$WRT_INFO"-"$WRT_BRANCH"-"$NAME"-"$WRT_DATE"."$EXT"
+              NEW_FILE="$WRT_INFO"-"$NAME"-"$WRT_DATE"."$EXT"
               mv -f $FILE ./upload/$NEW_FILE
             done
 
@@ -223,12 +291,16 @@ jobs:
           fi
 
       - name: Release Firmware
-        uses: softprops/action-gh-release@master
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
+          tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_DATE}}
           files: ./wrt/upload/*.*
           body: |
-            仅编译京东云太乙固件
+            这是个平台固件包，内含多个设备！
+            请注意选择你需要的设备固件！
+            不要问，刷就完事了！
+
+            全系带开源硬件加速，别问了！
 
             源码：${{env.WRT_REPO}}
             分支：${{env.WRT_BRANCH}}
