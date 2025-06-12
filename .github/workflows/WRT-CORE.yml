@@ -1,4 +1,4 @@
-#云编译公用核心 - 优化缓存版本
+#云编译公用核心
 name: WRT-CORE
 
 on:
@@ -108,97 +108,48 @@ jobs:
         run: |
           find ./ -maxdepth 3 -type f -iregex ".*\(txt\|sh\)$" -exec dos2unix {} \; -exec chmod +x {} \;
 
-      # 优化1: 拆分缓存，提高命中率
-      - name: Cache Toolchain
-        id: cache-toolchain
+      - name: Check Caches
+        id: check-cache
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@main
         with:
-          key: toolchain-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
-          restore-keys: |
-            toolchain-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
-            toolchain-${{env.WRT_CONFIG}}-
+          key: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_HASH}}
+          restore-keys: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}
           path: |
+            ./wrt/.ccache
             ./wrt/staging_dir/host*
             ./wrt/staging_dir/tool*
-
-      - name: Cache CCCache
-        id: cache-ccache
-        if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
-        with:
-          key: ccache-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{github.run_number}}
-          restore-keys: |
-            ccache-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
-            ccache-${{env.WRT_CONFIG}}-
-          path: ./wrt/.ccache
-
-      # 优化2: 新增下载包缓存
-      - name: Cache Downloads
-        id: cache-downloads
-        if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
-        with:
-          key: downloads-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{hashFiles('./wrt/feeds.conf.default')}}
-          restore-keys: |
-            downloads-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
-            downloads-${{env.WRT_CONFIG}}-
-          path: ./wrt/dl
-
-      # 优化3: 新增feeds缓存
-      - name: Cache Feeds
-        id: cache-feeds
-        if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
-        with:
-          key: feeds-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{hashFiles('./wrt/feeds.conf.default')}}
-          restore-keys: |
-            feeds-${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-
-            feeds-${{env.WRT_CONFIG}}-
-          path: |
-            ./wrt/feeds
-            ./wrt/package/feeds
 
       - name: Update Caches
         if: env.WRT_TEST != 'true'
         run: |
-          # 配置CCCache
-          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
-          export USE_CCACHE=1
-          ccache -M 2G
-          ccache -s
-
           if [ -d "./wrt/staging_dir" ]; then
             find "./wrt/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r DIR; do
               find "$DIR" -type f -exec touch {} +
             done
 
             mkdir -p ./wrt/tmp && echo "1" > ./wrt/tmp/.build
-            echo "toolchain cache restored!"
+
+            echo "toolchain skiped done!"
           else
-            echo "toolchain cache missed!"
+            echo "caches missed!"
           fi
 
-          # 清理旧缓存的逻辑保持不变，但只针对旧的组合缓存
-          if ${{steps.cache-toolchain.outputs.cache-hit != 'true'}}; then
-            CACHE_LIST=$(gh cache list --key "toolchain-$WRT_CONFIG-$WRT_INFO" | cut -f 1 | head -5)
+          if ${{steps.check-cache.outputs.cache-hit != 'true'}}; then
+            CACHE_LIST=$(gh cache list --key "$WRT_CONFIG-$WRT_INFO" | cut -f 1)
             for CACHE_KEY in $CACHE_LIST; do
-              gh cache delete $CACHE_KEY || true
+              gh cache delete $CACHE_KEY
             done
-            echo "old toolchain caches cleaned!"
+
+            echo "caches cleanup done!"
           fi
 
       - name: Update Feeds
         run: |
           cd ./wrt/
 
-          # 如果feeds缓存命中，跳过更新
-          if [ "${{steps.cache-feeds.outputs.cache-hit}}" = "true" ]; then
-            echo "feeds cache hit, skipping update"
-          else
-            ./scripts/feeds update -a
-            ./scripts/feeds install -a
-          fi
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
       - name: Custom Packages
         run: |
@@ -210,10 +161,6 @@ jobs:
       - name: Custom Settings
         run: |
           cd ./wrt/
-
-          # 启用CCCache
-          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
-          export USE_CCACHE=1
 
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
@@ -237,14 +184,7 @@ jobs:
         run: |
           cd ./wrt/
 
-          # 启用CCCache
-          export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
-          export USE_CCACHE=1
-
           make -j$(nproc) || make -j$(nproc) V=s
-
-          # 显示CCCache统计
-          ccache -s
 
       - name: Machine Information
         run: |
@@ -257,14 +197,6 @@ jobs:
           echo "======================="
           du -h --max-depth=1
           echo "======================="
-          
-          # 显示缓存使用情况
-          if [ -d ".ccache" ]; then
-            echo "CCCache Statistics:"
-            export CCACHE_DIR="$GITHUB_WORKSPACE/wrt/.ccache"
-            ccache -s
-            echo "======================="
-          fi
 
       - name: Package Firmware
         run: |
@@ -296,9 +228,7 @@ jobs:
           tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_INFO}}-${{env.WRT_DATE}}
           files: ./wrt/upload/*.*
           body: |
-            这是个平台固件包，内含多个设备！
-            请注意选择你需要的设备固件！
-            不要问，刷就完事了！
+            京东云太乙
 
             全系带开源硬件加速，别问了！
 
